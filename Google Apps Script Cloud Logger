@@ -1,0 +1,57 @@
+
+function doGet(e) {
+ var sheet = SpreadsheetApp.getActiveSpreadsheet().getActiveSheet();
+ var date = new Date();
+  var dayName = Utilities.formatDate(date, "Asia/Kolkata", "EEEE");
+ var timestamp = Utilities.formatDate(date, "Asia/Kolkata", "dd-MM-yyyy HH:mm:ss");
+
+
+ // Check if cell A1 has the correct banner text
+ var cellA1 = sheet.getRange("A1").getValue().toString();
+ if (cellA1 !== "Shiksha Sopan (Srajnik Lab)") {
+   // Insert 5 clean rows right at the very top (Row 1 to 5)
+   sheet.insertRowsBefore(1, 5);
+
+
+   // Set title and subtitle banner
+   sheet.getRange("A1").setValue("Shiksha Sopan (Srajnik Lab)").setFontWeight("bold").setFontSize(13);
+   sheet.getRange("A2").setValue("Heat Propagation Monitor").setFontWeight("bold").setFontSize(11);
+   sheet.getRange("A3").setValue("Live ESP32 Thermal Data").setFontStyle("italic").setFontColor("#555555");
+
+
+   // Row 5: Column headers
+   var headers = [
+     "Day",
+     "Timestamp",
+     "Temp 1 (°C)",
+     "Temp 2 (°C)",
+     "Temp 3 (°C)",
+     "Temp 4 (°C)",
+     "Temp 5 (°C)",
+     "Battery (V)",
+     "Battery (%)"
+   ];
+  
+   var headerRange = sheet.getRange(5, 1, 1, headers.length);
+   headerRange.setValues([headers]);
+   headerRange.setFontWeight("bold");
+   headerRange.setBackground("#e2e8f0");
+ }
+
+
+ // Parse sensor and battery metrics from ESP32 URL
+ var t1 = e.parameter.t1;
+ var t2 = e.parameter.t2;
+ var t3 = e.parameter.t3;
+ var t4 = e.parameter.t4;
+ var t5 = e.parameter.t5;
+ var batt = e.parameter.batt;
+ var pct = e.parameter.pct;
+
+
+ // Append new sensor reading
+ sheet.appendRow([dayName, timestamp, t1, t2, t3, t4, t5, batt, pct]);
+
+
+ return ContentService.createTextOutput("Success").setMimeType(ContentService.MimeType.TEXT);
+}
