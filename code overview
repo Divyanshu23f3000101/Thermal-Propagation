@@ -1,0 +1,346 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <HTTPClient.h>
+#include <WiFiClientSecure.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <math.h>
+
+// =====================================================
+// GOOGLE APPS SCRIPT CONFIGURATION
+// =====================================================
+const String GOOGLE_SCRIPT_ID = "AKfycbxhwANq7yR_dsTskFdE9H1ehOy4M62DXX4X1AVzJGE0INWsSRJTkn42Pvxi4bzTSe9oGg";
+
+// Logging interval: 15 seconds
+const unsigned long LOG_INTERVAL = 15000;
+unsigned long lastLogTime = 0;
+
+// =====================================================
+// LCD CONFIGURATION (Address: 0x27 or 0x3F)
+// =====================================================
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+// =====================================================
+// WIFI CREDENTIALS
+// =====================================================
+const char* ssid     = "SA Floor 2";
+const char* password = "TTLSHIWWYR";
+
+WebServer server(80);
+
+// =====================================================
+// SENSOR & BATTERY CONFIGURATION
+// =====================================================
+const int NUM_SENSORS = 5;
+const int SENSOR_PINS[NUM_SENSORS] = {34, 35, 32, 33, 36};
+const char* SENSOR_NAMES[NUM_SENSORS] = {"Temperature 1", "Temperature 2", "Temperature 3", "Temperature 4", "Temperature 5"};
+
+// Target calibration offsets
+const float TEMP_OFFSETS[NUM_SENSORS] = {
+  4.3,    // T1
+  6.5,    // T2
+  5.3,    // T3
+  2.0,    // T4
+  2.4     // T5
+};
+
+// Battery voltage pin on ADC1 (VN pin / GPIO 39)
+const int BATTERY_PIN = 39; 
+
+// =====================================================
+// NTC CONSTANTS
+// =====================================================
+const float VCC_MV    = 3300.0;    
+const float R_FIXED   = 10000.0;   // 10k fixed resistor
+const float R0        = 10000.0;   // 10k @ 25°C
+const float T_REF     = 298.15;    // 25°C in Kelvin
+const float BETA      = 3950.0;    
+const int NUM_SAMPLES = 20;
+
+float currentTemps[NUM_SENSORS] = {0};
+float batteryVoltage = 0.0;
+int batteryPercentage = 0;
+
+// Background task handle & lock
+TaskHandle_t sheetsTaskHandle = NULL;
+volatile bool isLoggingActive = false;
+
+// =====================================================
+// SENSOR ACQUISITION FUNCTIONS
+// =====================================================
+float readSensorTemp(int index) {
+  int pin = SENSOR_PINS[index];
+  long totalRaw = 0;
+  for (int i = 0; i < NUM_SAMPLES; i++) {
+    totalRaw += analogRead(pin);
+    delay(2);
+  }
+  float raw = totalRaw / (float)NUM_SAMPLES;
+
+  // Convert raw 12-bit ADC (0 - 4095) to millivolts
+  float vOut = (raw / 4095.0) * VCC_MV;
+
+  // Safety floor set to 2.0 mV to support sub-zero ranges down to -35 °C
+  if (vOut <= 2.0 || vOut >= (VCC_MV - 10.0)) return -999.0;
+
+  float rNtc = R_FIXED * ((VCC_MV - vOut) / vOut);
+  float tempK = 1.0 / ((1.0 / T_REF) + (1.0 / BETA) * log(rNtc / R0));
+  float rawTempC = tempK - 273.15;
+
+  return rawTempC + TEMP_OFFSETS[index];
+}
+
+float readBatteryVoltage() {
+  const int SAMPLES = 30;
+  long totalRaw = 0;
+
+  for (int i = 0; i < SAMPLES; i++) {
+    totalRaw += analogRead(BATTERY_PIN);
+    delay(2);
+  }
+  float rawAvg = totalRaw / (float)SAMPLES;
+
+  // 12-bit ADC conversion across 3.3V reference
+  float pinVoltage = (rawAvg / 4095.0) * 3.3;
+  float currentSample = pinVoltage * 3.09;
+
+  static float filteredVolts = 0.0;
+
+  if (filteredVolts == 0.0) {
+    filteredVolts = currentSample;
+    return filteredVolts;
+  }
+
+  // Reject sudden charger switching noise spikes (>0.30V delta)
+  if (abs(currentSample - filteredVolts) > 0.30) {
+    return filteredVolts; 
+  }
+
+  // Low-pass exponential moving average filter
+  filteredVolts = (0.85 * filteredVolts) + (0.15 * currentSample);
+
+  return filteredVolts;
+}
+
+int getBatteryPercentage(float voltage) {
+  if (voltage >= 8.00) return 100;
+  if (voltage <= 6.70) return 0;
+  
+  int pct = (int)(((voltage - 6.70) / 1.30) * 100.0);
+  return constrain(pct, 0, 100);
+}
+
+// =====================================================
+// ASYNC GOOGLE SHEETS TASK (RUNS ON CORE 0)
+// =====================================================
+void sheetsUploadTask(void *pvParameters) {
+  if (WiFi.status() == WL_CONNECTED) {
+    WiFiClientSecure client;
+    client.setInsecure(); // Skip certificate verification
+    client.setTimeout(15);
+
+    HTTPClient https;
+    String url = "https://script.google.com/macros/s/" + GOOGLE_SCRIPT_ID + "/exec?";
+    url += "t1=" + String(currentTemps[0], 2);
+    url += "&t2=" + String(currentTemps[1], 2);
+    url += "&t3=" + String(currentTemps[2], 2);
+    url += "&t4=" + String(currentTemps[3], 2);
+    url += "&t5=" + String(currentTemps[4], 2);
+    url += "&batt=" + String(batteryVoltage, 2);
+    url += "&pct=" + String(batteryPercentage);
+
+    if (https.begin(client, url)) {
+      https.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+      https.addHeader("User-Agent", "ESP32");
+      https.addHeader("Connection", "close");
+
+      int httpCode = https.GET();
+      if (httpCode > 0) {
+        Serial.printf("[Google Sheets] Logged successfully (HTTP %d)\n", httpCode);
+      } else {
+        Serial.printf("[Google Sheets] Request failed: %s\n", https.errorToString(httpCode).c_str());
+      }
+      https.end();
+    } else {
+      Serial.println("[Google Sheets] Unable to configure SSL connection");
+    }
+  } else {
+    Serial.println("[Google Sheets] Skipped: Wi-Fi offline");
+  }
+
+  isLoggingActive = false;
+  vTaskDelete(NULL);
+}
+
+void triggerSheetsUpload() {
+  if (!isLoggingActive) {
+    isLoggingActive = true;
+    xTaskCreatePinnedToCore(
+      sheetsUploadTask,
+      "SheetsTask",
+      8192,
+      NULL,
+      1,
+      &sheetsTaskHandle,
+      0
+    );
+  }
+}
+
+// =====================================================
+// EMBEDDED DASHBOARD HTML
+// =====================================================
+const char MAIN_PAGE[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Heat Propagation Monitor</title>
+  <style>
+    body { font-family: 'Segoe UI', sans-serif; background: #0f172a; color: #f8fafc; text-align: center; margin: 0; padding: 20px 10px; }
+    .sub-brand { color: #f59e0b; font-size: 18px; font-weight: 700; margin-bottom: 4px; }
+    h1 { color: #38bdf8; font-size: 24px; margin-top: 0; margin-bottom: 5px; }
+    p { color: #94a3b8; font-size: 14px; margin-top: 0; }
+    .battery-box { margin: 10px auto; font-size: 16px; font-weight: 600; color: #38bdf8; }
+    .grid { display: flex; flex-direction: column; gap: 12px; max-width: 400px; margin: 20px auto; }
+    .card { background: #1e293b; border: 1px solid #334155; border-radius: 12px; padding: 16px; display: flex; justify-content: space-between; align-items: center; }
+    .sensor-title { font-weight: 600; font-size: 16px; color: #e2e8f0; }
+    .temp-val { font-size: 22px; font-weight: bold; color: #4ade80; }
+    .hot { color: #f87171 !important; }
+  </style>
+</head>
+<body>
+  <div class="sub-brand">Shiksha Sopan (Srajnik Lab)</div>
+  <h1>Heat Propagation Monitor</h1>
+  <p>Live ESP32 Thermal Data</p>
+  <div class="battery-box">Battery: <span id="batt">-- V</span> (<span id="pct">--</span>%)</div>
+
+  <div class="grid">
+    <div class="card"><span class="sensor-title">Temperature 1</span><span id="t1" class="temp-val">-- &deg;C</span></div>
+    <div class="card"><span class="sensor-title">Temperature 2</span><span id="t2" class="temp-val">-- &deg;C</span></div>
+    <div class="card"><span class="sensor-title">Temperature 3</span><span id="t3" class="temp-val">-- &deg;C</span></div>
+    <div class="card"><span class="sensor-title">Temperature 4</span><span id="t4" class="temp-val">-- &deg;C</span></div>
+    <div class="card"><span class="sensor-title">Temperature 5</span><span id="t5" class="temp-val">-- &deg;C</span></div>
+  </div>
+
+  <script>
+    function updateUI(id, val) {
+      const el = document.getElementById(id);
+      if (val === -999.0) {
+        el.innerHTML = "DISCONNECTED";
+        el.className = "temp-val hot";
+      } else {
+        el.innerHTML = val.toFixed(2) + " &deg;C";
+        el.className = (val > 80.0) ? "temp-val hot" : "temp-val";
+      }
+    }
+
+    setInterval(function() {
+      fetch('/data')
+        .then(res => res.json())
+        .then(d => {
+          updateUI('t1', d.t1); 
+          updateUI('t2', d.t2); 
+          updateUI('t3', d.t3);
+          updateUI('t4', d.t4); 
+          updateUI('t5', d.t5);
+          document.getElementById('batt').innerHTML = d.batt.toFixed(2) + " V";
+          document.getElementById('pct').innerHTML = d.pct;
+        }).catch(err => console.error(err));
+    }, 1000);
+  </script>
+</body>
+</html>
+)rawliteral";
+
+void handleRoot() { 
+  server.send(200, "text/html", MAIN_PAGE); 
+}
+
+void handleData() {
+  String json = "{\"t1\":" + String(currentTemps[0], 2) +
+                ",\"t2\":" + String(currentTemps[1], 2) +
+                ",\"t3\":" + String(currentTemps[2], 2) +
+                ",\"t4\":" + String(currentTemps[3], 2) +
+                ",\"t5\":" + String(currentTemps[4], 2) +
+                ",\"batt\":" + String(batteryVoltage, 2) +
+                ",\"pct\":" + String(batteryPercentage) + "}";
+  server.send(200, "application/json", json);
+}
+
+// =====================================================
+// SETUP & LOOP
+// =====================================================
+void setup() {
+  Serial.begin(115200);
+
+  // I2C Pins
+  Wire.begin(21, 22); 
+  lcd.init();
+  lcd.backlight();
+  lcd.setCursor(0, 0);
+  lcd.print("Shiksha Sopan");
+  lcd.setCursor(0, 1);
+  lcd.print("Connecting WiFi");
+
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(400);
+    Serial.print(".");
+  }
+
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("WiFi Connected!");
+  lcd.setCursor(0, 1);
+  lcd.print(WiFi.localIP().toString());
+  
+  delay(5000); 
+  lcd.clear();
+
+  server.on("/", handleRoot);
+  server.on("/data", handleData);
+  server.begin();
+  Serial.println("\nHTTP Web Server started.");
+}
+
+void loop() {
+  server.handleClient();
+
+  static unsigned long lastSensorUpdate = 0;
+  if (millis() - lastSensorUpdate >= 1000) {
+    lastSensorUpdate = millis();
+
+    // 1. Read temperature sensors
+    for (int i = 0; i < NUM_SENSORS; i++) {
+      currentTemps[i] = readSensorTemp(i);
+      Serial.print(SENSOR_NAMES[i]);
+      Serial.print(": ");
+      Serial.print(currentTemps[i], 2);
+      Serial.print(" C | ");
+    }
+
+    // 2. Read battery voltage and calculate percentage
+    batteryVoltage = readBatteryVoltage();
+    batteryPercentage = getBatteryPercentage(batteryVoltage);
+    Serial.printf("Battery: %.2f V (%d%%)\n", batteryVoltage, batteryPercentage);
+
+    // 3. LCD Formatting
+    char row0[17];
+    snprintf(row0, sizeof(row0), "%.1f  %.1f  %3d%%", currentTemps[0], currentTemps[1], batteryPercentage);
+    lcd.setCursor(0, 0);
+    lcd.print(row0);
+
+    char row1[17];
+    snprintf(row1, sizeof(row1), "%.1f  %.1f  %.1f", currentTemps[2], currentTemps[3], currentTemps[4]);
+    lcd.setCursor(0, 1);
+    lcd.print(row1);
+  }
+
+  // 4. Trigger non-blocking cloud upload every 15 seconds
+  if (millis() - lastLogTime >= LOG_INTERVAL) {
+    lastLogTime = millis();
+    triggerSheetsUpload();
+  }
+}
